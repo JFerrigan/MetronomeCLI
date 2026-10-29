@@ -18,7 +18,13 @@ Arguments:
 
 The downbeat of each bar sounds higher than the other beats.
 Subdivisions are played more quietly than the main beats.
-Ctrl+C stops playback.
+During playback in a terminal:
+  Space: tap at least twice to set tempo (averages up to 4 intervals).
+  Up/Down: increase/decrease tempo by 1 BPM.
+  Right/Left: increase/decrease tempo by 10 BPM.
+  Ctrl+C: stop playback.
+Tempo stays within 30-300 BPM. A pause over 2.5 seconds or an arrow
+adjustment resets the tap sequence. The live display shows the current BPM.
 
 If clang++ isn't available, run: xcode-select --install
 If you don't hear sound, check the Mac's selected output device and volume.

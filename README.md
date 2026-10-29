@@ -10,6 +10,7 @@ A small command-line metronome for macOS, written in C++17. It synthesizes click
 - A higher-pitched accent on the first beat of each bar.
 - Quieter clicks for subdivisions.
 - Live beat and subdivision display in the terminal.
+- Tap tempo with Space, and adjust the tempo with the arrow keys during playback.
 
 ## Requirements
 
@@ -69,7 +70,18 @@ All arguments are optional and positional. Omitted arguments use their defaults.
 ./metronome 120 3
 ```
 
-Press **Ctrl+C** to stop playback. Show the built-in help with:
+While playing in a terminal:
+
+| Key | Control |
+| --- | --- |
+| Space | Tap at least twice to set the tempo |
+| Up / Down | Increase / decrease by 1 BPM |
+| Right / Left | Increase / decrease by 10 BPM |
+| Ctrl+C | Stop playback |
+
+Tap tempo averages the last four tap intervals. A pause longer than 2.5 seconds starts a new tap sequence. Arrow adjustments also reset the tap sequence. Tempo stays within 30–300 BPM, and the current BPM appears in the live display.
+
+Show the built-in help with:
 
 ```sh
 ./metronome --help

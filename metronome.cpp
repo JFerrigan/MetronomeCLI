@@ -4,13 +4,17 @@
 // Example: ./metronome 80 4 2
 
 #include <AudioToolbox/AudioToolbox.h>
+#include <termios.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -30,23 +34,107 @@ void onSignal(int) {
 
 struct Metronome {
     int bpm = 80;
+    std::atomic<int> requestedBpm{80};
     int beatsPerBar = 4;
     int subdivision = 1;
-    double samplesPerTick = 0.0;
-    std::uint64_t nextFrame = 0;  // Accessed only from Audio Queue callback thread.
+    // Timing state is accessed only from the Audio Queue callback thread.
+    double tickPhase = 0.0;
+    std::uint64_t tick = 0;
     std::atomic<std::uint64_t> latestTick{0};
     std::atomic<bool> audioError{false};
+    std::atomic<bool> stopping{false};
+};
+
+class Keyboard {
+public:
+    Keyboard() {
+        if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original_) != 0) return;
+        termios settings = original_;
+        settings.c_lflag &= ~(ICANON | ECHO);
+        settings.c_cc[VMIN] = 0;
+        settings.c_cc[VTIME] = 0;
+        enabled_ = tcsetattr(STDIN_FILENO, TCSANOW, &settings) == 0;
+    }
+
+    ~Keyboard() {
+        if (enabled_) tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+    }
+
+    bool enabled() const { return enabled_; }
+    int readKey() const {
+        unsigned char key;
+        return enabled_ && read(STDIN_FILENO, &key, 1) == 1 ? key : -1;
+    }
+
+private:
+    termios original_{};
+    bool enabled_ = false;
+};
+
+class TempoControls {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    int handle(int key, int bpm, Clock::time_point now = Clock::now()) {
+        if (key == 27) {
+            escapeState_ = 1;
+            return bpm;
+        }
+        if (escapeState_ == 1) {
+            escapeState_ = (key == '[' || key == 'O') ? 2 : 0;
+            return bpm;
+        }
+        if (escapeState_ == 2) {
+            // Keep reading CSI parameters, including modified arrow sequences.
+            if (key >= 0x20 && key <= 0x3f) return bpm;
+            escapeState_ = 0;
+            int delta = 0;
+            if (key == 'A') delta = 1;
+            if (key == 'B') delta = -1;
+            if (key == 'C') delta = 10;
+            if (key == 'D') delta = -10;
+            if (delta != 0) {
+                intervals_.clear();
+                lastTap_ = {};
+            }
+            return std::clamp(bpm + delta, 30, 300);
+        }
+        if (key != ' ') return bpm;
+
+        if (lastTap_ != Clock::time_point{}) {
+            const double seconds = std::chrono::duration<double>(now - lastTap_).count();
+            if (seconds < 0.1) return bpm;
+            if (seconds <= 2.5) {
+                intervals_.push_back(seconds);
+                if (intervals_.size() > 4) intervals_.pop_front();
+                double total = 0.0;
+                for (double interval : intervals_) total += interval;
+                bpm = std::clamp(static_cast<int>(std::lround(
+                    60.0 * intervals_.size() / total)), 30, 300);
+            } else {
+                intervals_.clear();
+            }
+        }
+        lastTap_ = now;
+        return bpm;
+    }
+
+private:
+    int escapeState_ = 0;
+    Clock::time_point lastTap_{};
+    std::deque<double> intervals_;
 };
 
 void fillBuffer(void* userData, AudioQueueRef queue, AudioQueueBufferRef buffer) {
     auto& m = *static_cast<Metronome*>(userData);
     auto* output = static_cast<std::int16_t*>(buffer->mAudioData);
     std::uint64_t lastTick = 0;
+    const double samplesPerTick = kSampleRate * 60.0 /
+        (m.requestedBpm.load(std::memory_order_relaxed) * m.subdivision);
 
     for (unsigned i = 0; i < kFramesPerBuffer; ++i) {
-        const double frame = static_cast<double>(m.nextFrame++);
-        const auto tick = static_cast<std::uint64_t>(frame / m.samplesPerTick);
-        const double phase = frame - static_cast<double>(tick) * m.samplesPerTick;
+        const auto tick = m.tick;
+        const double phase = m.tickPhase * samplesPerTick;
         lastTick = tick;
 
         double sample = 0.0;
@@ -62,11 +150,17 @@ void fillBuffer(void* userData, AudioQueueRef queue, AudioQueueBufferRef buffer)
                      std::sin(2.0 * kPi * pitch * t);
         }
         output[i] = static_cast<std::int16_t>(sample * 32767.0);
+        m.tickPhase += 1.0 / samplesPerTick;
+        if (m.tickPhase >= 1.0) {
+            m.tickPhase -= 1.0;
+            ++m.tick;
+        }
     }
 
     m.latestTick.store(lastTick, std::memory_order_relaxed);
     buffer->mAudioDataByteSize = kFramesPerBuffer * sizeof(std::int16_t);
-    if (AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr) != noErr) {
+    if (AudioQueueEnqueueBuffer(queue, buffer, 0, nullptr) != noErr &&
+        !m.stopping.load(std::memory_order_relaxed)) {
         m.audioError.store(true, std::memory_order_relaxed);
     }
 }
@@ -93,6 +187,10 @@ void usage(const char* executable) {
               << "  " << executable << " 60       # Quarter notes at 60 BPM\n"
               << "  " << executable << " 80 4 2   # Eighth notes at 80 BPM\n"
               << "  " << executable << " 100 4 4  # Sixteenth notes at 100 BPM\n\n"
+              << "Keyboard controls (while playing in a terminal):\n"
+              << "  Space: tap tempo (tap at least twice; averages up to 4 intervals)\n"
+              << "  Up/Down: +1/-1 BPM | Right/Left: +10/-10 BPM\n"
+              << "  Tempo stays within 30-300 BPM. Pause over 2.5s to restart tapping.\n"
               << "Press Ctrl+C to stop.\n";
 }
 }  // namespace
@@ -120,7 +218,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    m.samplesPerTick = kSampleRate * 60.0 / (m.bpm * m.subdivision);
+    m.requestedBpm.store(m.bpm);
 
     AudioStreamBasicDescription format{};
     format.mSampleRate = kSampleRate;
@@ -161,16 +259,31 @@ int main(int argc, char* argv[]) {
     }
 
     std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+    Keyboard keyboard;
+    TempoControls controls;
     std::cout << m.bpm << " BPM | " << m.beatsPerBar << "/4 | "
               << m.subdivision << " click(s)/beat | Ctrl+C to stop\n";
+    if (keyboard.enabled()) {
+        std::cout << "Space: tap tempo | Up/Down: +/-1 BPM | Right/Left: +/-10 BPM\n";
+    }
 
     std::uint64_t previousTick = UINT64_MAX;
     while (!gStopRequested && !m.audioError.load()) {
+        bool tempoChanged = false;
+        for (int key; (key = keyboard.readKey()) != -1;) {
+            const int bpm = controls.handle(key, m.bpm);
+            if (bpm != m.bpm) {
+                m.bpm = bpm;
+                m.requestedBpm.store(bpm, std::memory_order_relaxed);
+                tempoChanged = true;
+            }
+        }
         const auto tick = m.latestTick.load(std::memory_order_relaxed);
-        if (tick != previousTick) {
+        if (tick != previousTick || tempoChanged) {
             const auto beat = (tick / m.subdivision) % m.beatsPerBar + 1;
             const auto part = tick % m.subdivision + 1;
-            std::cout << "\rBeat " << beat << "/" << m.beatsPerBar;
+            std::cout << "\r" << m.bpm << " BPM | Beat " << beat << "/" << m.beatsPerBar;
             if (m.subdivision > 1) {
                 std::cout << "  subdivision " << part << "/" << m.subdivision;
             }
@@ -180,6 +293,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    m.stopping.store(true, std::memory_order_relaxed);
     AudioQueueStop(queue, true);
     AudioQueueDispose(queue, true);
     if (m.audioError.load()) {
